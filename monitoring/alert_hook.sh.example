@@ -1,0 +1,29 @@
+#!/bin/bash
+# Example alert hook. Copy to:
+#   VM:  ~/.local/share/mused/alert_hook.sh
+#   VPS: /var/log/muse-bridge/alert_hook.sh
+# chmod +x it. Alert JSON arrives on stdin.
+#
+# Pick ONE (or more) delivery method below.
+
+ALERT_JSON=$(cat)
+
+# --- 1. syslog (always safe) ---
+logger -t muse-monitor "$ALERT_JSON"
+
+# --- 2. Webhook (uncomment + fill URL) ---
+# Example: Telegram / DingTalk / Feishu / Slack incoming webhook
+# WEBHOOK_URL="https://oapi.dingtalk.com/robot/send?access_token=XXXX"
+# SEV=$(echo "$ALERT_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['severity'])")
+# ID=$(echo "$ALERT_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+# MSG=$(echo "$ALERT_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['message'])")
+# HOST=$(echo "$ALERT_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['host'])")
+# curl -s -m 10 -X POST "$WEBHOOK_URL" \
+#   -H 'Content-Type: application/json' \
+#   -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"[$SEV][$HOST] $ID: $MSG\"}}" >/dev/null
+
+# --- 3. agent-mail to 超管 Muse (VM only, uncomment if wanted) ---
+# echo "$ALERT_JSON" | ~/.agent-mail/bin/agent-mail send \
+#   --to muse --kind alert --body-file /dev/stdin >/dev/null 2>&1
+
+exit 0

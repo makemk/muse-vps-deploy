@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""museapi: CLI client for the mused daemon.
+
+Token: read from ~/.config/mused/token (600) unless --token is given.
+Socket path: from ~/.config/mused/config.json unless --socket is given.
+
+Usage:
+  ./museapi GET /status
+  ./museapi --target RD-928 POST /cmd '{"command":"echo hi"}'
+  ./museapi --token $TOKEN POST /cmd '{"target":"RD-928","command":"echo hi"}'
+  ./museapi --health            # daemon liveness probe (no token needed)
+
+--target TARGET is a shortcut: it fills body["target"] (overrides any
+target already in the JSON body).
+"""
+import json
+import os
+import socket
+import struct
+import sys
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(HOME, ".config", "mused")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+DEFAULT_TOKEN_FILE = os.path.join(CONFIG_DIR, "token")
+DEFAULT_SOCKET = "/tmp/mused.sock"
+
+HDR = struct.Struct("!I")
+
+
+def load_client_config():
+    """Returns (socket_path, token_file) from config.json or defaults."""
+    sock = DEFAULT_SOCKET
+    token_file = DEFAULT_TOKEN_FILE
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if isinstance(cfg, dict):
+            if cfg.get("socket_path"):
+                sock = os.path.expanduser(cfg["socket_path"])
+            if cfg.get("token_file"):
+                token_file = os.path.expanduser(cfg["token_file"])
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+    return sock, token_file
+
+
+def read_token_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def send_frame(sock, obj):
+    blob = json.dumps(obj).encode("utf-8")
+    sock.sendall(HDR.pack(len(blob)) + blob)
+
+
+def recv_frame(sock):
+    hdr = b""
+    while len(hdr) < HDR.size:
+        chunk = sock.recv(HDR.size - len(hdr))
+        if not chunk:
+            raise ConnectionError("daemon closed")
+        hdr += chunk
+    (n,) = HDR.unpack(hdr)
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(min(65536, n - len(buf)))
+        if not chunk:
+            raise ConnectionError("daemon closed mid-frame")
+        buf += chunk
+    return json.loads(buf.decode("utf-8"))
+
+
+def do_health(sock_path):
+    """Health check: daemon alive if it answers on the unix socket.
+
+    Sends GET /status with an empty token. Any HTTP response — even 401 —
+    proves the daemon is up and its upstream TLS path works. Exit 0 on
+    response, 3 if the daemon isn't running, 1 on error.
+    """
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(sock_path)
+    except FileNotFoundError:
+        print(f"NOT RUNNING: no socket at {sock_path}", file=sys.stderr)
+        return 3
+    except OSError as e:
+        print(f"NOT RUNNING: cannot connect to {sock_path}: {e}",
+              file=sys.stderr)
+        return 3
+    try:
+        send_frame(s, {"token": "", "method": "GET", "path": "/status",
+                       "body": None})
+        resp = recv_frame(s)
+    except Exception as e:
+        print(f"ERROR: health probe failed: {e}", file=sys.stderr)
+        return 1
+    finally:
+        s.close()
+    if resp.get("error"):
+        print(f"DEGRADED: daemon answered but reported: {resp['error']}",
+              file=sys.stderr)
+        return 1
+    print(f"OK: daemon alive (upstream HTTP {resp.get('status')})")
+    return 0
+
+
+def main(argv):
+    sock_path, token_file = load_client_config()
+    if "--health" in argv:
+        argv = [a for a in argv if a != "--health"]
+        for i, a in enumerate(argv):  # allow --socket override with --health
+            if a == "--socket" and i + 1 < len(argv):
+                sock_path = argv[i + 1]
+        return do_health(sock_path)
+    token = ""
+    target = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--token" and i + 1 < len(argv):
+            token = argv[i + 1]
+            i += 2
+        elif argv[i] == "--socket" and i + 1 < len(argv):
+            sock_path = argv[i + 1]
+            i += 2
+        elif argv[i] == "--target" and i + 1 < len(argv):
+            target = argv[i + 1]
+            i += 2
+        elif argv[i] in ("-h", "--help"):
+            print(__doc__, file=sys.stderr)
+            return 0
+        else:
+            rest.append(argv[i])
+            i += 1
+    if len(rest) < 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    if not token:
+        token = read_token_file(token_file)
+    method, path = rest[0].upper(), rest[1]
+    body = json.loads(rest[2]) if len(rest) > 2 else None
+    if target is not None:
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            print("--target requires a JSON object body", file=sys.stderr)
+            return 2
+        body["target"] = target  # CLI flag wins over body content
+    if not token:
+        print(f"no token: --token not given and {token_file} missing/empty",
+              file=sys.stderr)
+        return 2
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(sock_path)
+    except FileNotFoundError:
+        print(f"daemon not running (no {sock_path})", file=sys.stderr)
+        return 3
+    send_frame(s, {"token": token, "method": method, "path": path,
+                   "body": body})
+    resp = recv_frame(s)
+    s.close()
+    if resp.get("error"):
+        print(f"ERROR: {resp['error']}", file=sys.stderr)
+        return 1
+    print(f"HTTP {resp['status']}")
+    print(resp.get("body", ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

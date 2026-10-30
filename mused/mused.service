@@ -1,0 +1,40 @@
+# mused.service — VM-side HTTPS command forwarder daemon (SSH-free VM→VPS bridge)
+#
+# Install modes:
+#   user   (default): ~/.config/systemd/user/mused.service via install.sh
+#                    (install.sh strips the User= line — not allowed in user units)
+#   system:          /etc/systemd/system/mused.service via install.sh --system
+#
+# Logs are dual-written by the daemon itself:
+#   - rotating file: ~/.local/share/mused/mused.log (10MB x 5, built-in)
+#   - stderr      -> journald (this unit), view with: journalctl --user -u mused -f
+# No logrotate config needed for the daemon file (built-in rotation);
+# journald retention is managed by the system (SystemMaxUse etc.).
+
+[Unit]
+Description=mused - HTTPS command forwarder daemon (SSH-free VM to VPS bridge)
+Documentation=file:///home/hatch/workspace/muse-vps-deploy/mused/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=hatch
+WorkingDirectory=/home/hatch
+ExecStart=/home/hatch/.local/bin/mused
+Restart=always
+RestartSec=5
+# stderr/stdout -> journald (daemon also writes its own rotating log file)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mused
+# Proxy env is injected by install.sh at install time (daemon needs it for
+# CONNECT+TLS through the egress proxy). Kept as comments here as documentation:
+# Environment=https_proxy=http://127.0.0.1:PORT
+# Environment=HTTPS_PROXY=http://127.0.0.1:PORT
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

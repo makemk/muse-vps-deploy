@@ -1,0 +1,50 @@
+# Nginx hardening for the /muse-api/ location (VPS 38.207.167.51)
+# Companion to SECURITY_REVIEW.md R4/R5. Merge into the existing server block
+# that already proxies /muse-api/ -> 127.0.0.1:8471.
+#
+# What this adds:
+#   1. Rate limiting on the API (brute-force / DoS mitigation)
+#   2. Access logs WITHOUT query strings (tokens must never hit disk via ?token=)
+#   3. Large-body guard (defense in depth; the bridge should also cap reads)
+
+# --- rate limit zone (put in http{} context, once) ---
+# 10 req/s sustained per client IP, burst 20. Tune to your workload:
+# a single interactive session rarely exceeds 2-3 req/s; batch jobs can
+# burst higher - raise `burst` rather than `rate` if legitimate bursts 429.
+limit_req_zone $binary_remote_addr zone=museapi:10m rate=10r/s;
+limit_req_status 429;
+
+# --- strip query string for logging (put in http{} context, once) ---
+# $request_uri includes "?token=..." - never write that to disk.
+map $request_uri $loggable_uri {
+    ~^(?<p>[^?]*)  $p;
+    default        $request_uri;
+}
+log_format museapi_sanitized '$remote_addr - $remote_user [$time_local] '
+    '"$request_method $loggable_uri $server_protocol" '
+    '$status $body_bytes_sent "$http_referer" '
+    '"$http_user_agent" rt=$request_time';
+
+server {
+    # ... existing listen/ssl config unchanged ...
+
+    location /muse-api/ {
+        # R4: rate limit
+        limit_req zone=museapi burst=20 nodelay;
+
+        # R5: sanitized access log (no query strings); keep an error log
+        access_log /var/log/nginx/muse-api.log museapi_sanitized;
+        error_log  /var/log/nginx/muse-api-error.log warn;
+
+        # Defense in depth: reject absurd bodies before they reach the bridge.
+        # The bridge itself has no Content-Length cap (pre-existing issue P1).
+        client_max_body_size 1m;
+
+        # Existing proxy config below (unchanged)
+        proxy_pass http://127.0.0.1:8471;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        # NOTE: do NOT forward X-Forwarded-For-based auth decisions;
+        # the bridge authenticates via Bearer token only.
+    }
+}

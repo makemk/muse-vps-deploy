@@ -1,0 +1,510 @@
+openapi: 3.0.3
+info:
+  title: muse-api — VM→VPS→PC command relay
+  description: |
+    HTTPS command relay for the "去 SSH" architecture: the VM-side daemon
+    (or `musecli`) calls these endpoints on the VPS (nginx → 127.0.0.1:8471),
+    which forwards to the target PC over its WSS long connection.
+
+    Base path on the wire is `/muse-api/` (nginx strips the prefix before
+    proxying to 8471, so the service sees `/status`, `/cmd`, …).
+
+    Auth: `Authorization: Bearer <muse_…>` (preferred, v2).
+    Legacy fallbacks still accepted: `X-Bridge-Token` header, `token` in the
+    JSON body, `?token=` / `?access_token=` query params.
+
+    v2 additions (per Gemini architecture review):
+    - `GET /health` — unauthenticated liveness (nginx rate-limited 10r/s)
+    - `request_id` (UUIDv4) — idempotent dedup state machine
+      (IN_FLIGHT / COMPLETED / UNCERTAIN, 300s TTL from completion)
+    - `X-Muse-Target` — target PC header for consistent-hash sharding
+    - `X-Muse-Batchable: 1` — opt-in for daemon micro-batch coalescing
+    - `Content-Encoding: deflate` — app-layer payload compression
+      (VPS passes bytes through, never decompresses)
+  version: 2.0.0
+  contact:
+    name: muse-vps-deploy
+
+servers:
+  - url: https://38.207.167.51/muse-api
+    description: VPS production (SNI ai.vps38.local, VPS38 Root CA)
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: "muse_<token_urlsafe(32)>"
+      description: |
+        Controller token. `muse_` prefix + 32 bytes URL-safe base64
+        (256-bit entropy). VPS stores only the SHA-256 hex digest in
+        /etc/muse-bridge/controllers.json (0600).
+
+  headers:
+    X-Muse-Target:
+      description: |
+        Target PC hostname. Required for super controllers (pcs=["*"]);
+        optional for 1:1 bound controllers (auto-resolved). Also used by
+        nginx `hash $http_x_muse_target consistent` for sharded workers.
+      schema:
+        type: string
+        example: RD-928
+    X-Muse-Batchable:
+      description: |
+        Opt-in for daemon micro-batch coalescing. Only requests with this
+        header (or read-only ops) are merged into a single /batch call.
+      schema:
+        type: string
+        enum: ["1"]
+        example: "1"
+
+  schemas:
+    Error:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          example: false
+        error:
+          type: string
+          example: "Unauthorized: invalid bridge token"
+
+    AsyncAccepted:
+      type: object
+      required: [ok, id]
+      description: Returned by wait=false calls; poll GET /result/{id}.
+      properties:
+        ok:
+          type: boolean
+          example: true
+        id:
+          type: string
+          description: Async request id, e.g. cmd_1697692800000_a1b2c3
+          example: cmd_1697692800000_a1b2c3
+
+    CmdRequest:
+      type: object
+      required: [command]
+      properties:
+        command:
+          type: string
+          description: Shell command executed on the PC.
+          example: echo hello
+        timeout:
+          type: integer
+          default: 60
+          description: Seconds; PC-side execution timeout.
+          example: 60
+        cwd:
+          type: string
+          description: Working directory on the PC.
+          example: C:\Users\J03378\Documents\vscode_env
+        wait:
+          type: boolean
+          default: true
+          description: |
+            true = block until PC returns the result.
+            false = return {ok,id} immediately; fetch via GET /result/{id}.
+        target:
+          type: string
+          description: |
+            Target PC hostname. Super controllers MUST set it (403 otherwise);
+            bound controllers may omit it (auto-resolved to their PC).
+          example: RD-928
+        request_id:
+          type: string
+          format: uuid
+          description: |
+            v2: caller-generated UUIDv4 for idempotent dedup. Server falls
+            back to generating one for legacy callers.
+        token:
+          type: string
+          description: Legacy auth fallback (prefer Authorization header).
+
+    CmdResult:
+      type: object
+      description: Result object returned by the PC plugin (wait=true).
+      properties:
+        ok:
+          type: boolean
+          example: true
+        stdout:
+          type: string
+          example: "hello\n"
+        stderr:
+          type: string
+          example: ""
+        exit_code:
+          type: integer
+          example: 0
+        id:
+          type: string
+          description: Echoed request id.
+
+    BatchRequest:
+      type: object
+      properties:
+        commands:
+          type: array
+          description: |
+            Array of command strings (v1) — or, for daemon micro-batches,
+            sub-request objects each carrying its own sub_request_id.
+          items:
+            type: string
+          example: ["echo a", "echo b"]
+        timeout:
+          type: integer
+          default: 180
+        wait:
+          type: boolean
+          default: true
+        target:
+          type: string
+          example: RD-928
+        request_id:
+          type: string
+          format: uuid
+        token:
+          type: string
+
+    BatchItemResult:
+      type: object
+      required: [id, code]
+      description: |
+        v2 micro-batch contract: outer HTTP status is ALWAYS 200 while the
+        channel is healthy; per-item failures are isolated here (never turn
+        the whole batch into a 500, or the other items would spuriously retry).
+      properties:
+        id:
+          type: string
+          description: Sub-request id assigned by the daemon.
+          example: sub_01
+        code:
+          type: integer
+          description: PC-side exit code of this item.
+          example: 0
+        stdout:
+          type: string
+        stderr:
+          type: string
+
+    FileRequest:
+      type: object
+      required: [op]
+      properties:
+        op:
+          type: string
+          enum: [read, write, edit, glob, grep, info, list, archive, extract]
+          description: |
+            Maps to plugin protocol types: read→read_file, write→write_file,
+            edit→edit_file, glob→glob_files, grep→grep_files, info→file_info,
+            list→list_dir, archive→archive_7z, extract→extract_7z.
+          example: read
+        path:
+          type: string
+          example: C:\a\b.txt
+        content:
+          type: string
+          description: File content for write/edit (base64 for binary).
+        encoding:
+          type: string
+          default: utf-8
+          description: Text encoding, or "base64".
+        pattern:
+          type: string
+          description: Glob/grep pattern.
+        timeout:
+          type: integer
+          default: 60
+        wait:
+          type: boolean
+          default: true
+        target:
+          type: string
+        request_id:
+          type: string
+          format: uuid
+        token:
+          type: string
+
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing/invalid token (check Authorization header)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: |
+        Token valid but not permitted: source IP not in allowed_ips,
+        target PC not in token's pcs list, or super controller omitted target.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TargetNotFound:
+      description: Named target PC is not online
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/Error"
+              - type: object
+                properties:
+                  error:
+                    example: "Target 'FOO' not online. Online: ['RD-928']"
+    AmbiguousTarget:
+      description: Multiple PCs online and no target specified
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NoPcOnline:
+      description: No PC connected to the bridge at all
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+paths:
+  /status:
+    get:
+      summary: Service status (AUTHENTICATED)
+      description: |
+        NOTE: per current implementation, /status sits BEHIND the auth
+        check (401 on bad/missing token). It is NOT public.
+        For unauthenticated liveness use GET /health.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  version: { type: string, example: "1.1.0" }
+                  clients: { type: integer, description: Online PC count }
+                  client_list:
+                    type: array
+                    items: { type: object }
+                    description: Per-PC client info (see P2 privacy note).
+                  pending: { type: integer, description: In-flight futures }
+                  completed_results:
+                    type: integer
+                    description: Cached wait=false results awaiting pickup
+                  uptime: { type: integer, description: Epoch seconds }
+        "401":
+          description: Invalid or missing token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /health:
+    get:
+      summary: Liveness probe (NO AUTH)
+      description: |
+        v2 (Gemini review). Placed BEFORE the auth block. nginx rate-limits
+        to 10r/s. Exposes only non-sensitive data: no tokens, no command
+        content, client IPs anonymized to /24.
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok], example: ok }
+                  version: { type: string, example: "1.1.0" }
+                  uptime_s: { type: integer }
+                  wss_clients: { type: integer }
+                  client_list:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string, example: RD-928 }
+                        last_seen: { type: integer }
+                        ip: { type: string, description: Anonymized /24 }
+                  pending_futures: { type: integer }
+                  api:
+                    type: object
+                    properties:
+                      req_total: { type: integer }
+                      http_401: { type: integer }
+                      http_403: { type: integer }
+                      lat_p99_ms: { type: number }
+
+  /cmd:
+    post:
+      summary: Execute a shell command on the target PC
+      parameters:
+        - $ref: "#/components/headers/X-Muse-Target"
+          # header alternative to body.target; body wins if both set
+        - name: X-Muse-Batchable
+          in: header
+          required: false
+          schema: { type: string, enum: ["1"] }
+        - name: Content-Encoding
+          in: header
+          required: false
+          description: "deflate = app-layer zlib payload (level=1); VPS passes through untouched."
+          schema: { type: string, enum: [deflate, identity] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CmdRequest" }
+      responses:
+        "200":
+          description: |
+            wait=true → CmdResult from the PC.
+            wait=false → AsyncAccepted {ok,id}; fetch via GET /result/{id}.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/CmdResult"
+                  - $ref: "#/components/schemas/AsyncAccepted"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/TargetNotFound" }
+        "409": { $ref: "#/components/responses/AmbiguousTarget" }
+        "503": { $ref: "#/components/responses/NoPcOnline" }
+        "504":
+          description: |
+            v2: EXECUTION_UNCERTAIN — retry with the same request_id hit an
+            UNCERTAIN record (WSS dropped mid-flight). Never auto-retry with
+            a new id; caller must probe PC state first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /batch:
+    post:
+      summary: Execute multiple commands (v1 list / v2 micro-batch)
+      description: |
+        v1: {commands:[...]} executed by the PC plugin.
+        v2 (daemon micro-batch): sub-requests merged by the daemon share one
+        outer request_id; dedup tracks outer id; response is an array of
+        BatchItemResult. Outer HTTP status is always 200 on a healthy channel.
+      parameters:
+        - name: X-Muse-Target
+          in: header
+          required: false
+          schema: { type: string }
+        - name: Content-Encoding
+          in: header
+          required: false
+          schema: { type: string, enum: [deflate, identity] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BatchRequest" }
+      responses:
+        "200":
+          description: wait=true → array of BatchItemResult (v2) or PC batch result (v1); wait=false → AsyncAccepted.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items: { $ref: "#/components/schemas/BatchItemResult" }
+                  - $ref: "#/components/schemas/AsyncAccepted"
+                  - type: object
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/TargetNotFound" }
+        "409": { $ref: "#/components/responses/AmbiguousTarget" }
+        "503": { $ref: "#/components/responses/NoPcOnline" }
+
+  /file:
+    post:
+      summary: File operations on the target PC
+      description: |
+        op selects the plugin protocol type. Large transfers should be
+        chunked to ≤64KB per request by the caller (WSS head-of-line
+        blocking); the VPS scheduler allows max 1 in-flight /file chunk
+        per PC and always prioritizes /cmd over /file.
+      parameters:
+        - name: X-Muse-Target
+          in: header
+          required: false
+          schema: { type: string }
+        - name: Content-Encoding
+          in: header
+          required: false
+          description: Recommended for text payloads >2KB (zlib level=1).
+          schema: { type: string, enum: [deflate, identity] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FileRequest" }
+      responses:
+        "200":
+          description: wait=true → op-specific result from PC; wait=false → AsyncAccepted.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                  - $ref: "#/components/schemas/AsyncAccepted"
+        "400":
+          description: Unknown op or malformed body
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/TargetNotFound" }
+        "409": { $ref: "#/components/responses/AmbiguousTarget" }
+        "503": { $ref: "#/components/responses/NoPcOnline" }
+
+  /result/{id}:
+    get:
+      summary: Fetch an async (wait=false) result
+      description: |
+        id = the async request id returned by a wait=false call
+        (cmd_<ts>_<rand> / bat_<ts>_<rand> / fil_<ts>_<rand>), or the
+        caller-supplied request_id under the v2 dedup machine.
+        Results are single-consume: a second GET returns 404.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+          example: cmd_1697692800000_a1b2c3
+      responses:
+        "200":
+          description: The PC result (same shape as the wait=true response).
+          content:
+            application/json:
+              schema: { type: object }
+        "400":
+          description: Missing result id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Result id not found or already consumed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "504":
+          description: Timed out (60s) waiting for the in-flight result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }

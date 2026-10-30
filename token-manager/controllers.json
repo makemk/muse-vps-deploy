@@ -1,0 +1,20 @@
+{
+  "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef": {
+    "muse": "muse-rd928",
+    "pcs": [
+      "RD-928"
+    ],
+    "created": "2026-10-19T02:19:11.242712+00:00",
+    "label": "RD-928 专属",
+    "enabled": true
+  },
+  "cafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00d": {
+    "muse": "super",
+    "pcs": [
+      "*"
+    ],
+    "created": "2026-10-19T02:19:11.304231+00:00",
+    "label": "超管 Muse",
+    "enabled": true
+  }
+}

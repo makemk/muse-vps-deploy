@@ -1,0 +1,48 @@
+// mused 配置示例。复制为 ~/.config/mused/config.json 后按需修改。
+// 注意：本文件是 JSONC（含 // 整行注释），install.sh 安装时会自动去掉注释行。
+// 未列出的字段使用 daemon 内建默认值；未知字段会被忽略并记一条 warning。
+{
+  // VPS 公网 IP（muse-api 的 HTTPS 入口）
+  "vps_host": "38.207.167.51",
+
+  // VPS HTTPS 端口（nginx 监听 443）
+  "vps_port": 443,
+
+  // TLS SNI：代理做 CONNECT 后，nginx 靠这个 SNI 路由到 muse-api；
+  // 必须和 VPS 服务器证书 SAN 中的域名一致，否则 TLS 握手失败
+  "sni": "ai.vps38.local",
+
+  // VPS 自建 Root CA 证书路径：daemon 用它校验 VPS 服务端证书。
+  // 留空则用系统默认 CA（会失败，因为 VPS 是自签 CA）
+  "ca_cert_path": "/home/hatch/workspace/muse-bridge/src/muse/vps-root-ca.pem",
+
+  // 控制器 token 文件路径（600 权限），daemon 启动时不读、每次转发时由
+  // 客户端（museapi）读取并随请求发送。token 本身永不写进 config.json
+  "token_file": "~/.config/mused/token",
+
+  // daemon 监听的 unix socket 路径（0600），museapi 通过它发送命令
+  "socket_path": "/tmp/mused.sock",
+
+  // 存活探测间隔（秒）：daemon 定期 GET /muse-api/status，
+  // 401 也算链路正常；失败则指数退避重连（上限 30s）
+  "heartbeat_interval": 30,
+
+  // 日志级别：DEBUG / INFO / WARNING / ERROR（默认 INFO）
+  "log_level": "INFO",
+
+  // 微批聚合开关（默认 false）。开启后，并发请求按 target 合并为
+  // POST /muse-api/batch（1.5ms 窗口、上限 10 条/64KB）。
+  // 注意：VPS 端必须先实现新的 multiplexing /batch 线路格式
+  //   {"batch_id":..., "requests":[{"id","method","path","body"},...]}
+  //   -> 200 [{"id","status","body"},...]
+  // （不是旧的 {"commands":[...]} shell 批处理格式），否则不要开启。
+  "microbatch_enabled": false,
+
+  // 应用层端到端压缩开关（默认 true）。开启后，>=2KB 的请求体用
+  // zlib(level=1) 压缩并带 Content-Encoding: deflate 头发送；响应按
+  // Content-Encoding 头解压。VPS 只做字节透传，不感知压缩。
+  // 注意：PC 插件必须先实现解压侧（见 DECOMPRESS_SPEC.md，Phase 2），
+  // 否则 >2KB 的请求在 PC 端会收到无法解析的 deflate 二进制。
+  // 插件解压未落地前，请把这里设为 false。
+  "compress_enabled": true
+}
